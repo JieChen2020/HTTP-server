@@ -98,4 +98,4 @@ def receive_data():
 
 
 if __name__ == '__main__':
-    app.run(host='10.97.40.181', port=8003)
+    app.run(host='', port=8003)
