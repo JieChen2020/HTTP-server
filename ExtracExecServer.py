@@ -96,5 +96,5 @@ def encode_images_from_folder(folder_path):
 
 if __name__ == '__main__':
     # Start the Flask server on the specified host and port
-    app.run(host='10.97.62.119', port=8002)
+    app.run(host='', port=8002)
 
