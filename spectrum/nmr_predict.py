@@ -19,7 +19,7 @@ def c_nmr_predict(smiles, solvent="CDCl3"):
         solvent2 = "Chloroform-D1 (CDCl3)"
     elif solvent == "DMSO-d6":
         solvent2 = "Dimethylsulphoxide-D6 (DMSO-D6, C2D6SO)"
-    r1 = requests.post("http://10.72.234.91:8000/api/predict/carbon?solvent="+quote(solvent2), json={"smiles": smiles})
+    r1 = requests.post("http://10.72.xx.xx:8000/api/predict/carbon?solvent="+quote(solvent2), json={"smiles": smiles})
     carbon_preds = r1.json()
 
     smiles_carb = carbon_preds[0]
@@ -51,7 +51,7 @@ def h_nmr_predict(smiles, solvent="CDCl3"):
         solvent1 = "Chloroform-D1 (CDCl3)"
     elif solvent == "DMSO-d6":
         solvent1 = "Dimethylsulphoxide-D6 (DMSO-D6, C2D6SO)"
-    r = requests.post("http://10.72.234.91:8000/api/predict/proton?solvent="+quote(solvent1), json={"smiles": smiles})
+    r = requests.post("http://10.72.xx.xx:8000/api/predict/proton?solvent="+quote(solvent1), json={"smiles": smiles})
     proton_preds = r.json()
 
     smiles_prot = proton_preds[0]
