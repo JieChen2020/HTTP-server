@@ -16,7 +16,7 @@ def get_id(mac):
     return robot_id
 
 
-def opentrons_control(file="D:\\Auto_Opentrons\\test.py"):
+def opentrons_control(file="D:\\Opentrons\\test.py"):
     mac = 'b8-27-eb-9e-0e-77'
     ip = get_id(mac)
 
@@ -63,5 +63,5 @@ def opentrons_control(file="D:\\Auto_Opentrons\\test.py"):
 
 
 if __name__ == "__main__":
-    opentrons_control(file="D:\\Auto_Opentrons\\LiquidAdd.py")
+    opentrons_control(file="D:\\Opentrons\\LiquidAdd.py")
 
