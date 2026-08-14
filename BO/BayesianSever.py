@@ -2,7 +2,7 @@ import requests
 import json
 
 # API的基本URL
-base_url = 'http://10.97.40.181:123'
+base_url = ''
 
 # 初始请求数据
 data = {
