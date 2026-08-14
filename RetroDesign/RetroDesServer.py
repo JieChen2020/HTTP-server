@@ -14,7 +14,7 @@ EXCEL_PATH = 'smiles_taskId.xlsx'
 EXCEL_PATH_2 = 'smiles_price.xlsx'
 URL = "https://ai-cn.chemlex.com/retroplanning"
 HEADERS = {
-    "X-SECRET-API-KEY": "96667896156d976a3ab95d2a42e6a3f302221957e8600f1e342864b593d9f4fcaa756fb13beab1dc549bb88d3340e786526f8f8eed666923077a0389d7c495c0",
+    "X-SECRET-API-KEY": "",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
