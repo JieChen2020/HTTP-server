@@ -32,4 +32,4 @@ async def exp(data: ExpData):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 if __name__ == '__main__':
-    uvicorn.run(app="http_api:app", host="10.97.40.181", port=123)
+    uvicorn.run(app="http_api:app", host="", port=123)
