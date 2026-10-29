@@ -78,7 +78,7 @@ def receive_data():
         else:
             # Generate experimental 1H and 13C NMR reports from stored parameters
             h_nmr = generate_h_nmr_report(data_path="/data/" + NMR_file + "/1/pdata/1/", smiles=input_smiles, solvent=solvent)
-            c_nmr = generate_c_nmr_report(data_path="/data/" + NMR_file + "/2/pdata/1/")
+            c_nmr = generate_c_nmr_report(data_path="/data/" + NMR_file + "/2/pdata/1/", solvent=solvent)
             nmr_report = "Experimental NMR report is: " + h_nmr + ". " + c_nmr + "."
 
             # Optionally append predicted 1H NMR
