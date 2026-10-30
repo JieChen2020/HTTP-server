@@ -1,348 +1,426 @@
-from flask import Flask, request, jsonify
-import requests
-import json
-import pandas as pd
+"""
+RetroDesServer.py
+-----------------
+Flask HTTP service that wraps the ChemLex retrosynthesis planning API
+(https://ai-cn.chemlex.com/retroplanning) so that client can drive it
+with a simple submit/query protocol.
+
+Protocol (POST /receive_data, JSON body {"data": ...}):
+    {"data": "<json with a SMILES field>"}  -> submit (or reuse) a retrosynthesis task
+    {"data": "query"}                       -> poll the current task, or fetch its routes
+
+A completed task is returned as a Step-based dict produced by
+extract_reaction_tree_dict(), where every compound is enriched with its
+chemical name (ChemScript), price and molecular weight (RDKit).
+"""
 import os
-from anytree import Node, RenderTree
-import copy
+import sys
+import json
+import subprocess
+
+import pandas as pd
+import requests
+from flask import Flask, request, jsonify
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
+# ChemScript installation layout. Only the child process spawned by
+# extract_reaction_tree_dict() actually loads this library, because its native
+# extension (_ChemScript20forPy25/26/31/32.pyd) cannot run under Python 3.12.
+CS_LIB = r"C:\Program Files\PerkinElmerInformatics\ChemOffice2020\ChemScript\Lib"
 
-app = Flask(__name__)
-EXCEL_PATH = 'smiles_taskId.xlsx'
-EXCEL_PATH_2 = 'smiles_price.xlsx'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_PATH = os.path.join(BASE_DIR, 'smiles_taskId.xlsx')
+
 URL = "https://ai-cn.chemlex.com/retroplanning"
 HEADERS = {
     "X-SECRET-API-KEY": "",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
-current_task_id = 1
+
+# Id of the task currently owned by this service. 1 means "no active task":
+# the client submits first and queries afterwards, so a single slot is enough.
+NO_TASK = 1
+current_task_id = NO_TASK
+
+# Maximum number of buyable routes returned per task.
+MAX_ROUTES = 10
+
+app = Flask(__name__)
 
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    # Http server status
+    """Liveness probe, used by the client to verify the service is up."""
     return jsonify({"status": "online"})
 
 
 @app.route('/receive_data', methods=['POST'])
 def receive_data():
+    """Single entry point implementing the submit/query state machine.
+
+    Body {"data": "query"} asks for the result of the active task; any other
+    payload must contain a SMILES and (re)submits a planning task.
+    """
     global current_task_id
 
     try:
         request_data = request.get_json()
         data = request_data.get('data')
-        print(data)
 
-        if data != "query":
-            tool_input_str = json.loads(data).get('SMILES')
-            print(tool_input_str)
-            df = load_excel()
-            task_row = df[df['smiles'] == tool_input_str]
-            if not task_row.empty:
-                current_task_id = int(task_row.iloc[0]['taskId'])
-                print(current_task_id)
-                response = ({"status": "running"})
-            else:
-                current_task_id = submit_task(tool_input_str)
-                if isinstance(current_task_id, int):
-                    save_task_to_excel(tool_input_str, current_task_id)
-                    response = {"status": "running"}
-                else:
-                    current_task_id = 1  # initialize
-                    response = {"status": "error", "message": "Submit task failed"}
+        if data == "query":
+            if current_task_id == NO_TASK:
+                return jsonify({"status": "error", "message": "No valid taskId available"})
 
-        else:
-            print(current_task_id)
-            if current_task_id == 1:
-                response = {"status": "error", "message": "No valid taskId available"}
-            else:
-                result = get_result(current_task_id)
-                if result.get("status") == "completed":
-                    result["status"] = "success"
-                    response = result
-                    print(response)
-                    current_task_id = 1
-                else:
-                    response = result
+            result = get_result(current_task_id)
+            if result.get("status") == "completed":
+                # Task finished: release the slot so the next submit starts clean.
+                result["status"] = "success"
+                current_task_id = NO_TASK
+            return jsonify(result)
 
-        return jsonify(response)
+        # Submit branch: reuse the recorded taskId when this SMILES was already
+        # submitted before, otherwise create a new task and remember it.
+        smiles = json.loads(data).get('SMILES')
+        df = load_excel()
+        task_row = df[df['smiles'] == smiles]
+
+        if not task_row.empty:
+            current_task_id = int(task_row.iloc[0]['taskId'])
+            return jsonify({"status": "running"})
+
+        new_task_id = submit_task(smiles)
+        if not isinstance(new_task_id, int):
+            current_task_id = NO_TASK
+            return jsonify({"status": "error", "message": "Submit task failed"})
+
+        current_task_id = new_task_id
+        save_task_to_excel(smiles, new_task_id)
+        return jsonify({"status": "running"})
 
     except Exception as e:
-        current_task_id = 1
+        current_task_id = NO_TASK
         return jsonify({"status": "error", "message": str(e)})
 
 
 def submit_task(smiles):
-    try:
-        data = {
-            "method": "submit_task",
+    """Submit a retrosynthesis planning job, return the taskId or None on failure.
+
+    Search is configured for model-based, fast mode with a maximum tree depth
+    of 3 and a 60 second simulation budget.
+    """
+    payload = {
+        "method": "submit_task",
+        "param": {
             "param": {
-                "param":
-                    {
-                        "smiles": smiles,
-                        "param": {
-                            "search_mode": {
-                                "use_expert_rules": False,
-                                "use_model": True,
-                                "creative_mode": False,
-                                "fast_mode": True
-                            },
-                            "max_depth": 3,
-                            "disliked_reactions": [],
-                            "disliked_compounds": [],
-                            "max_simulation_time": 60
-                        }
-                    }
+                "smiles": smiles,
+                "param": {
+                    "search_mode": {
+                        "use_expert_rules": False,
+                        "use_model": True,
+                        "creative_mode": False,
+                        "fast_mode": True
+                    },
+                    "max_depth": 3,
+                    "disliked_reactions": [],
+                    "disliked_compounds": [],
+                    "max_simulation_time": 60
+                }
             }
         }
-        payload = json.dumps(data)
-        response = requests.post(URL, headers=HEADERS, data=payload)
-        if response.status_code == 200:
-            return response.json().get("data")
-        else:
+    }
+
+    try:
+        response = requests.post(URL, headers=HEADERS, json=payload)
+        if response.status_code != 200:
             return None
+        return response.json().get("data")
     except Exception as e:
+        print(f"submit_task failed: {e}")
         return None
 
 
-def get_result(taskId):
+def get_result(task_id):
+    """Poll one task and always return a dict with a 'status' key.
+
+    Statuses returned to the client:
+        running   - task still pending/started, 'message' carries the progress
+        completed - 'pathN' / 'pathN_info' pairs for up to MAX_ROUTES routes
+        failed    - the remote task reported a failure
+        error     - transport or parsing problem
+    """
+    payload = {
+        "method": "get_result",
+        "param": {"taskId": task_id}
+    }
+
     try:
-        data = {
-            "method": "get_result",
-            "param": {"taskId": taskId}
-        }
-        payload = json.dumps(data)
-        response = requests.post(URL, headers=HEADERS, data=payload)
-
-        if response.status_code == 200:
-            res_json = json.loads(response.text)
-            status = res_json["data"].get("status", "")
-            process = res_json["data"].get("process", 0)
-
-            if status == "completed":
-                result_raw = res_json["data"].get("result")
-                if not result_raw:
-                    return {"status": "error", "message": "Result field is empty"}
-                try:
-                    list_of_paths = json.loads(result_raw)
-                    result_dict = {"status": "completed"}
-                    j = 1
-                    for i in range(50):
-                        if list_of_paths[i]['is_buyable_route'] and j < 50:
-                            path_info = list_of_paths[i]['path']
-                            print(path_info)
-                            simplified_path_info = extract_relevant_fields(path_info)
-                            result_dict[f"path{j}_info"] = copy.deepcopy(simplified_path_info)
-                            reaction_tree = extract_reaction_tree_dict(simplified_path_info)
-                            result_dict[f"path{j}"] = reaction_tree
-                            j = j + 1
-
-                    return result_dict
-                except Exception as e:
-                    return {"status": "error", "message": f"Failed to parse result: {str(e)}"}
-
-            elif status in ["pending", "start"]:
-                return {"status": "running", "message": f"Task is {status}. Current process: {process}%"}
-
-            elif status == "fail":
-                return {"status": "failed", "message": "Task failed during execution"}
-
-            else:
-                return {"status": "error", "message": f"Unknown status: {status}"}
-
-        else:
+        response = requests.post(URL, headers=HEADERS, json=payload)
+        if response.status_code != 200:
             return {"status": "error", "message": f"HTTP {response.status_code}"}
+
+        res_json = json.loads(response.text)
+        task = res_json.get("data") or {}
+        status = task.get("status", "")
+        process = task.get("process", 0)
+
+        if status in ("pending", "start"):
+            return {"status": "running", "message": f"Task is {status}. Current process: {process}%"}
+
+        if status == "fail":
+            return {"status": "failed", "message": "Task failed during execution"}
+
+        if status != "completed":
+            return {"status": "error", "message": f"Unknown status: {status}"}
+
+        result_raw = task.get("result")
+        if not result_raw:
+            return {"status": "error", "message": "Result field is empty"}
+
+        try:
+            list_of_paths = json.loads(result_raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            return {"status": "error", "message": f"Failed to parse result: {e}"}
+
+        result_dict = {"status": "completed"}
+        route_index = 1
+        for route in list_of_paths:
+            if route_index > MAX_ROUTES:
+                break
+            if not route.get('is_buyable_route'):
+                continue
+
+            # Keep the trimmed raw tree for auditing and the Step view for display.
+            simplified_path_info = extract_relevant_fields(route['path'])
+            reaction_tree = extract_reaction_tree_dict(simplified_path_info)
+            print(reaction_tree)
+            result_dict[f"path{route_index}_info"] = simplified_path_info
+            result_dict[f"path{route_index}"] = reaction_tree
+            route_index += 1
+
+        return result_dict
+
     except Exception as e:
-        return f"Error: {str(e)}"
+        print(f"get_result failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 
-def save_task_to_excel(smiles, taskId):
+def save_task_to_excel(smiles, task_id):
+    """Append a (smiles, taskId) pair to the task cache workbook."""
     df = load_excel()
-    new_row = pd.DataFrame([[smiles, taskId]], columns=['smiles', 'taskId'])
-    df = pd.concat([df, new_row], ignore_index=True)
-    df.to_excel(EXCEL_PATH, index=False)
+    new_row = pd.DataFrame([[smiles, task_id]], columns=['smiles', 'taskId'])
+    pd.concat([df, new_row], ignore_index=True).to_excel(EXCEL_PATH, index=False)
 
 
 def load_excel():
+    """Load the task cache, returning an empty frame when it does not exist yet."""
     if os.path.exists(EXCEL_PATH):
         return pd.read_excel(EXCEL_PATH)
-    else:
-        return pd.DataFrame(columns=['smiles', 'taskId'])
-
-
-def load_excel_price():
-    if os.path.exists(EXCEL_PATH_2):
-        return pd.read_excel(EXCEL_PATH_2)
-    else:
-        return pd.DataFrame(columns=['smiles', 'price'])
+    return pd.DataFrame(columns=['smiles', 'taskId'])
 
 
 def extract_relevant_fields(node: dict) -> dict:
+    """Recursively keep only the fields needed downstream.
+
+    Kept per node: smiles, id, terminal, price, the single best-matching
+    reaction condition and (recursively) children. Keys are omitted rather
+    than defaulted, so callers must use .get().
     """
-    Recursively extracts only the required fields from a reaction tree node:
-    - smiles
-    - terminal
-    - children (recursively)
-    - id
-    - price
-    - reaction_conditions (effective)
-    """
+    def flatten_entries(source):
+        """Flatten either [[entry, ...], ...] or [entry, ...] into one entry list."""
+        entries = []
+        for item in source or []:
+            if isinstance(item, list):
+                entries.extend(item)
+            elif isinstance(item, dict):
+                entries.append(item)
+        return entries
+
     def extract_valid_condition(cond: dict) -> dict:
-        def flatten_entries(source):
-            """Flatten source data into a list of entries, compatible with both [[entry, ...]] and [entry, ...] structures"""
-            entries = []
-            if not source:
-                return entries
-            for item in source:
-                if isinstance(item, list):
-                    entries.extend(item)
-                elif isinstance(item, dict):
-                    entries.append(item)
-            return entries
+        """Pick the entry with the highest yield among patents and expert rules.
 
-        # Merge from_patents and from_expert
-        patents = cond.get("from_patents", [])
+        Only entries carrying a preparation procedure are considered. A missing
+        or unparseable yield counts as the 30% baseline, so an entry must beat
+        that baseline to be selected at all.
+        """
+        BASELINE_YIELD = 30.0
+
         experts_raw = cond.get("from_experts", [])
-        experts = [e.get("expert_recommended", e) if isinstance(e, dict) else e for e in (experts_raw if isinstance(experts_raw, list) else [experts_raw])]
-        all_entries = flatten_entries(patents) + flatten_entries(experts)
-        if all_entries:
-            best_entry = {}
-            max_yield = 30  # default yield is 30 if "yield" is "N/A"
+        if not isinstance(experts_raw, list):
+            experts_raw = [experts_raw]
+        experts = [
+            e.get("expert_recommended", e) if isinstance(e, dict) else e
+            for e in experts_raw
+        ]
 
-            for entry in all_entries:
-                preparation = entry.get("preparation", "N/A")
-                if preparation == "N/A":
-                    continue
+        candidates = flatten_entries(cond.get("from_patents", [])) + flatten_entries(experts)
 
-                # Default "yield" to 30 if it's "N/A"
-                entry_yield = entry.get("yield", "N/A")
-                entry_yield = 30 if entry_yield == "N/A" else float(entry_yield)
+        best_entry = {}
+        best_yield = BASELINE_YIELD
+        for entry in candidates:
+            if entry.get("preparation", "N/A") == "N/A":
+                continue
 
-                # Check if this entry has a higher yield
-                if entry_yield > max_yield:
-                    max_yield = entry_yield
-                    best_entry = entry
+            raw_yield = entry.get("yield", "N/A")
+            try:
+                entry_yield = float(str(raw_yield).rstrip('%'))
+            except (ValueError, TypeError):
+                entry_yield = BASELINE_YIELD
 
-            if best_entry:
-                return best_entry
+            if entry_yield > best_yield:
+                best_yield = entry_yield
+                best_entry = entry
 
-        return {}
+        return best_entry
 
     result = {}
 
-    if 'smiles' in node:
-        result['smiles'] = node['smiles']
-    if 'id' in node:
-        result['id'] = node['id']
-    if 'terminal' in node:
-        result['terminal'] = node['terminal']
-    if 'compound_attributes' in node:
-        result['price'] = node['compound_attributes']['price']
+    for key in ('smiles', 'id', 'terminal'):
+        if key in node:
+            result[key] = node[key]
+
+    price = (node.get('compound_attributes') or {}).get('price')
+    if price is not None:
+        result['price'] = price
 
     if 'reaction_conditions' in node:
-        selected_condition = extract_valid_condition(node['reaction_conditions'])
-        result['reaction_conditions'] = selected_condition
+        result['reaction_conditions'] = extract_valid_condition(node['reaction_conditions'])
 
-    if 'children' in node:
-        result['children'] = [extract_relevant_fields(child) for child in node['children']]
-    else:
-        result['children'] = []
+    result['children'] = [extract_relevant_fields(child) for child in node.get('children', [])]
 
     return result
 
 
 def extract_reaction_tree_dict(data_dict: dict) -> dict:
-    df = load_excel_price()
+    """Convert a trimmed reaction tree into a retrosynthesis-ordered Step dict.
+
+    The search tree is written product -> reactants, i.e. root first, while a
+    chemist reads a route bottom-up. Levels are therefore remapped so that the
+    last level becomes "Step 1" and the root becomes the highest step.
+
+    Each compound is described by its SMILES, chemical name, price and molecular
+    weight. The name comes from ChemScript, resolved through a child process.
+    """
     level_info = {}
+    compound_cache = {}
 
-    def get_price(smiles_str: str):
-        row = df[df['smiles'] == smiles_str]
-        if not row.empty and 'price' in row.columns:
-            return row.iloc[0]['price']
-        else:
+    # ChemScript's native module only supports Python 2.5/2.6/3.1/3.2, so it is
+    # driven from a separate interpreter via pythonnet (.NET Framework) and the
+    # managed assembly. Keeping it in a child process also means a pythonnet
+    # failure degrades only the "Name" field instead of breaking the service.
+    chem_name_code = r'''
+import os
+import sys
+
+lib = sys.argv[1]
+net = os.path.join(lib, "Net")
+smiles = sys.argv[2]
+
+# These handles must stay alive, otherwise the added DLL directories are dropped.
+handles = [
+    os.add_dll_directory(lib),
+    os.add_dll_directory(net)
+]
+
+load_ns = {}
+exec("from pythonnet import load", load_ns)
+load_ns["load"]("netfx")
+
+import clr
+clr.AddReference(os.path.join(net, "CambridgeSoft.ChemScript20.dll"))
+from CambridgeSoft.ChemScript20 import StructureData
+
+mol = StructureData.LoadData(smiles, "smiles")
+print("__RESULT__" + str(mol.ChemicalName()).strip(), flush=True)
+'''
+
+    def resolve_chemical_name(smiles_str: str) -> str:
+        """Return the ChemScript chemical name of a SMILES, or 'N.A.' on any failure."""
+        if not smiles_str:
             return 'N.A.'
 
-    def get_name(smiles_str: str):
-        row = df[df['smiles'] == smiles_str]
-        if not row.empty and 'name' in row.columns:
-            return row.iloc[0]['name']
-        else:
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", chem_name_code, CS_LIB, smiles_str],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30
+            )
+        except subprocess.TimeoutExpired:
+            print(f"Chemical name lookup timed out: {smiles_str}")
+            return 'N.A.'
+        except Exception as e:
+            print(f"Chemical name lookup failed for {smiles_str}: {e}")
             return 'N.A.'
 
-    def get_mw(smiles_str: str):
-        """Calculate molecular weight from SMILES using RDKit, return 'N.A.' on failure"""
+        # Read backwards because ChemScript may print its own output first.
+        for line in reversed(completed.stdout.splitlines()):
+            if line.startswith("__RESULT__"):
+                name = line[len("__RESULT__"):].strip()
+                if name and name.lower() not in ('none', 'nan'):
+                    return name
+                break
+
+        print(f"Chemical name not resolved for {smiles_str}: "
+              f"{(completed.stderr or '').strip()[:300]}")
+        return 'N.A.'
+
+    def get_molecular_weight(smiles_str: str) -> float | str:
+        """Molecular weight from RDKit, or 'N.A.' when the SMILES is invalid."""
         try:
             mol = Chem.MolFromSmiles(smiles_str)
-            if mol is None:
-                return 'N.A.'
-            return round(Descriptors.MolWt(mol), 1)
+            return round(Descriptors.MolWt(mol), 1) if mol is not None else 'N.A.'
         except Exception:
             return 'N.A.'
 
-    def get_reagent_info(smiles_str: str):
-        """Get name, price, and molecular weight simultaneously, return [name, price, mw]"""
-        price = get_price(smiles_str)
-        name = get_name(smiles_str)
-        mw = get_mw(smiles_str)
-        return {
+    def describe_compound(smiles_str: str, price) -> dict:
+        """Build the compound description, memoised because SMILES repeat across steps."""
+        if smiles_str not in compound_cache:
+            compound_cache[smiles_str] = {
                 "Reagent SMILES": smiles_str,
-                "Name": name,
-                "Price": price,
-                "Molecular Weight": mw,
+                "Name": resolve_chemical_name(smiles_str),
+                "Molecular Weight": get_molecular_weight(smiles_str)
             }
+        # Copy so that a per-step price does not leak into the cached entry.
+        return {**compound_cache[smiles_str], "Price": price}
 
     def traverse(node, level=0):
+        """Record the first reaction seen at each depth, then descend."""
         if node.get("terminal", True):
             return
 
-        children = node.get("children", []) or []
+        children = node.get("children") or []
 
-        reactant = []
-        for child in children:
-            smi = child.get("smiles", "")
-            reactant.append(get_reagent_info(smi))
-
-        product_smiles = node.get("smiles", "")
-        product = get_reagent_info(product_smiles)
-
-        # Only record the first time this level is encountered
+        # Only the first reaction found at a given depth is reported.
         if level not in level_info:
-            reaction_conditions = node.get("reaction_conditions", {}) or {}
-            reaction_conditions = dict(reaction_conditions)  # shallow copy
-
             level_info[level] = {
-                "Product": product,
-                "Reactant": reactant,
-                "Synthetic description for reference": reaction_conditions.get('preparation', 'N.A.'),
+                "Product": describe_compound(node.get("smiles", ""), node.get("price")),
+                "Reactant": [
+                    describe_compound(child.get("smiles", ""), child.get("price"))
+                    for child in children
+                ],
+                "Synthetic description for reference":
+                    (node.get("reaction_conditions") or {}).get('preparation', 'N.A.'),
             }
 
-        # Recurse into child nodes
         for child in children:
             traverse(child, level + 1)
 
-        # Traverse the entire tree first
-
     traverse(data_dict)
 
-    result = {}
+    if not level_info:
+        return {}
 
-    if level_info:
-        # Maximum level, e.g. Level 0,1,2 -> max_level = 2
-        max_level = max(level_info.keys())
-
-        # Map level to Step: Level 0 -> Step N (max), Level 1 -> Step N-1, ..., Level N -> Step 1
-        for level in sorted(level_info.keys()):
-            step_index = max_level - level + 1
-            step_key = f"Step {step_index}"
-            result[step_key] = level_info[level]
-
-    return result
+    # Deepest level is the first synthetic step; the root is the final step.
+    max_level = max(level_info)
+    return {
+        f"Step {max_level - level + 1}": level_info[level]
+        for level in sorted(level_info)
+    }
 
 
 if __name__ == '__main__':
     app.run(host='', port=8002)
-    # print(get_result(21))
-    # print(submit_task("FC(F)(F)C1=CC(=NN1C1=CC=C(Br)C=C1)C1=CC=CC=C1"))
