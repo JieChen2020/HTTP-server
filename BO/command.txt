@@ -1,2 +1,0 @@
-docker build -t bo_novartis .
-docker run -d --name bo_api -p 123:123 bo_novartis
